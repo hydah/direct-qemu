@@ -1,0 +1,1 @@
+'./configure' '--prefix=/usr' '--disable-docs' '--disable-system' '--prefix=/usr' '--target-list=i386-linux-user' '--disable-sdl' '--disable-attr' '--disable-guest-base' '--disable-uuid' '--disable-curses'  
