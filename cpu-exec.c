@@ -208,6 +208,12 @@ int cpu_exec(CPUArchState *env)
     uint8_t *tc_ptr;
     tcg_target_ulong next_tb;
 
+    env->tb_tag = 0;
+    new_tb_count = -500;
+#ifdef RETRANS_IND
+    env->has_ind = false;
+#endif
+
     if (cpu->halted) {
         if (!cpu_has_work(cpu)) {
             return EXCP_HALTED;
@@ -261,6 +267,8 @@ int cpu_exec(CPUArchState *env)
 
             next_tb = 0; /* force lookup of first TB */
             for(;;) {
+                prolog_count++;
+
                 interrupt_request = cpu->interrupt_request;
                 if (unlikely(interrupt_request)) {
                     if (unlikely(cpu->singlestep_enabled & SSTEP_NOIRQ)) {
@@ -356,22 +364,31 @@ int cpu_exec(CPUArchState *env)
 #if defined(DEBUG_DISAS)
                 if (qemu_loglevel_mask(CPU_LOG_TB_CPU)) {
                     /* restore flags in standard format */
-#if defined(TARGET_I386)
                     log_cpu_state(cpu, CPU_DUMP_CCOP);
-#endif
                 }
 #endif /* DEBUG_DISAS */
                 spin_lock(&tcg_ctx.tb_ctx.tb_lock);
-                tb = tb_find_fast(env);
-                /* Note: we do it here to avoid a gcc bug on Mac OS X when
-                   doing it in tb_find_slow */
-                if (tcg_ctx.tb_ctx.tb_invalidated_flag) {
-                    /* as some TB could have been invalidated because
-                       of memory exceptions while generating the code, we
-                       must recompute the hash index here */
-                    next_tb = 0;
-                    tcg_ctx.tb_ctx.tb_invalidated_flag = 0;
+                
+                tb = get_next_tb(env, env->eip, (TranslationBlock *)next_tb);
+
+                if (env->ind_type != NOT_IND) {
+                    /* from {ret, ind_jmp, ind_call} */
+                    if(prev_tb == 0) {
+                        /*from sieve */
+                        add_sieve_entry(env, tb, env->ind_type);
+                        env->ind_type = NOT_IND;
+                    } else {
+                        if (env->ind_type == TYPE_SYACALL) {
+                            next_tb = 0;
+                        } else {
+#ifdef IND_OPT
+                            patch_ind_opt((TranslationBlock *)next_tb, tb);
+                            next_tb = 0;
+#endif
+                        }
+                    }
                 }
+
                 if (qemu_loglevel_mask(CPU_LOG_EXEC)) {
                     qemu_log("Trace %p [" TARGET_FMT_lx "] %s\n",
                              tb->tc_ptr, tb->pc, lookup_symbol(tb->pc));
@@ -379,10 +396,17 @@ int cpu_exec(CPUArchState *env)
                 /* see if we can patch the calling TB. When the TB
                    spans two pages, we cannot safely do a direct
                    jump. */
-                if (next_tb != 0 && tb->page_addr[1] == -1) {
-                    tb_add_jump((TranslationBlock *)(next_tb & ~TB_EXIT_MASK),
-                                next_tb & TB_EXIT_MASK, tb);
+                if (next_tb != 0 && (uint32_t)tb != next_tb) {
+                    tb_add_jump((TranslationBlock *)(next_tb),
+                                env->patch_num, tb);
                 }
+#ifdef RETRANS_IND
+                if (env->has_ind == true) {
+                    chg_tbs_tag((TranslationBlock *)(env->ind_tb, NORMAL_TB_TAG));
+                    env->has_ind = false;
+                }
+#endif
+
                 spin_unlock(&tcg_ctx.tb_ctx.tb_lock);
 
                 /* cpu_interrupt might be called while translating the
@@ -392,7 +416,13 @@ int cpu_exec(CPUArchState *env)
                 cpu->current_tb = tb;
                 barrier();
                 if (likely(!cpu->exit_request)) {
+
                     tc_ptr = tb->tc_ptr;
+                    env->target_tc = (uint32_t)tc_ptr;
+                    env->ret_tb = 0;
+                    env->trapnr = -1;
+                    env->ind_type = NOT_IND;
+
                     /* execute the generated code */
                     next_tb = cpu_tb_exec(cpu, tc_ptr);
                     switch (next_tb & TB_EXIT_MASK) {
@@ -451,11 +481,9 @@ int cpu_exec(CPUArchState *env)
     } /* for(;;) */
 
 
-#if defined(TARGET_I386)
     /* restore flags in standard format */
     env->eflags = env->eflags | cpu_cc_compute_all(env, CC_OP)
         | (env->df & DF_MASK);
-#endif
 
     /* fail safe : never use current_cpu outside cpu_exec() */
     current_cpu = NULL;

@@ -279,6 +279,9 @@ void cpu_loop(CPUX86State *env)
     abi_ulong pc;
     target_siginfo_t info;
 
+    memset(tb_phys_hash, 0, CODE_GEN_PHYS_HASH_SIZE * sizeof(void *));
+    codecache_prologue_init(env);
+
     for(;;) {
         trapnr = cpu_x86_exec(env);
         switch(trapnr) {
@@ -1010,14 +1013,13 @@ int main(int argc, char **argv, char **envp)
     env->regs[R_EBP] = regs->ebp;
     env->regs[R_ESP] = regs->esp;
     env->eip = regs->eip;
-    fprintf(stderr, "env->regs[esp] is %x\n", regs->esp);
+
+#ifdef SIEVE_OPT
+    map_exec(env->sieve_hashtable, sizeof(env->sieve_hashtable));
+#endif
 
     /* linux interrupt setup */
-#ifndef TARGET_ABI32
-    env->idt.limit = 511;
-#else
     env->idt.limit = 255;
-#endif
     env->idt.base = target_mmap(0, sizeof(uint64_t) * (env->idt.limit + 1),
                                 PROT_READ|PROT_WRITE,
                                 MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
@@ -1069,20 +1071,12 @@ int main(int argc, char **argv, char **envp)
     }
     cpu_x86_load_seg(env, R_CS, __USER_CS);
     cpu_x86_load_seg(env, R_SS, __USER_DS);
-#ifdef TARGET_ABI32
     cpu_x86_load_seg(env, R_DS, __USER_DS);
     cpu_x86_load_seg(env, R_ES, __USER_DS);
     cpu_x86_load_seg(env, R_FS, __USER_DS);
     cpu_x86_load_seg(env, R_GS, __USER_DS);
     /* This hack makes Wine work... */
     env->segs[R_FS].selector = 0;
-#else
-    cpu_x86_load_seg(env, R_DS, 0);
-    cpu_x86_load_seg(env, R_ES, 0);
-    cpu_x86_load_seg(env, R_FS, 0);
-    cpu_x86_load_seg(env, R_GS, 0);
-#endif
-#endif
 
 
     if (gdbstub_port) {
