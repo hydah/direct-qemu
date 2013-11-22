@@ -20,6 +20,7 @@
 #define CPU_I386_H
 
 #include "config.h"
+#include "opt-def.h"
 #include "qemu-common.h"
 
 #ifdef TARGET_X86_64
@@ -727,6 +728,53 @@ typedef enum TPRAccess {
     TPR_ACCESS_WRITE,
 } TPRAccess;
 
+#ifdef RET_CACHE
+#define RET_CACHE_SIZE		(1024 * 64)
+///#define RET_CACHE_SIZE	(1024 * 1024 * 16)
+#define RET_HASH_MASK		((RET_CACHE_SIZE-1))
+#define RET_HASH_FUNC(b,i)	((uint32_t)(b) + ((i) & RET_HASH_MASK) * 4)
+#endif
+
+enum enum_ind_type {
+    NOT_IND = 0,
+    IND_TYPE_CALL,
+    IND_TYPE_JMP,
+    IND_TYPE_RET,
+    IND_TYPE_RECUR,
+    IND_TYPE_CALL_SP,
+    IND_TYPE_JMP_SP,
+	IND_SWITCH_TYPE,
+    IND_TYPE_RET_SP,
+    TYPE_SYSCALL,
+};
+    
+/* add for switch case */
+#define SA_SIZE (1 << 15)
+typedef struct sa_table {
+	uint32_t src;
+	uint32_t dest;
+} sa_table;
+#ifdef SIEVE_OPT
+#define SIEVE_SIZE		(1<<16)
+#define SIEVE_MASK		((SIEVE_SIZE - 1) << 3)
+#define SIEVE_HASH(b, i)	((uint32_t)(b) + ((i) & SIEVE_MASK))
+
+typedef struct sieve_entry sieve_entry;
+struct sieve_entry {
+    unsigned char jmp_byte;       /* 1 */
+    unsigned long rel;            /* 4 */
+    unsigned char filler[3];      /* 3 */
+} __attribute__((packed));
+#endif
+
+typedef struct patch_entry {
+    uint8_t *at;
+    uint8_t *to;
+    uint8_t *tb;
+    uint32_t func_addr;
+    uint32_t tb_tag;
+} patch_entry;
+
 typedef struct CPUX86State {
     /* standard registers */
     target_ulong regs[CPU_NB_REGS];
@@ -883,6 +931,16 @@ typedef struct CPUX86State {
     uint64_t xcr0;
 
     TPRAccess tpr_access_type;
+
+
+    target_ulong target_tc;
+
+    /* added by heyu */
+    uint32_t esp_tmp;
+    uint32_t ret_tb;
+    uint32_t ind_dest;
+    uint32_t ind_type;
+    uint32_t trapnr;
 } CPUX86State;
 
 #include "cpu-qom.h"
@@ -1147,6 +1205,7 @@ static inline bool cpu_has_work(CPUState *cs)
 }
 
 #include "exec/exec-all.h"
+
 
 static inline void cpu_get_tb_cpu_state(CPUX86State *env, target_ulong *pc,
                                         target_ulong *cs_base, int *flags)

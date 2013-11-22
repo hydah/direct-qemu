@@ -29,11 +29,10 @@
 #include "qemu.h"
 #include "qemu-common.h"
 #include "qemu/cache-utils.h"
-#include "cpu.h"
-#include "tcg.h"
 #include "qemu/timer.h"
 #include "qemu/envlist.h"
 #include "elf.h"
+#include "translate-all.h"
 
 char *exec_path;
 
@@ -278,12 +277,14 @@ void cpu_loop(CPUX86State *env)
     int trapnr;
     abi_ulong pc;
     target_siginfo_t info;
+    TCGContext *cgc = &tcg_ctx;
 
-    memset(tb_phys_hash, 0, CODE_GEN_PHYS_HASH_SIZE * sizeof(void *));
-    codecache_prologue_init(env);
+    memset(tcg_ctx.tb_ctx.tb_phys_hash, 0, CODE_GEN_PHYS_HASH_SIZE * sizeof(void *));
+
+    tcg_prologue_init(env, cgc);
 
     for(;;) {
-        trapnr = cpu_x86_exec(env);
+        trapnr = cpu_exec(env);
         switch(trapnr) {
         case 0x80:
             /* linux syscall from int $0x80 */
@@ -870,6 +871,7 @@ int main(int argc, char **argv, char **envp)
     if (cpu_model == NULL) {
         cpu_model = "qemu32";
     }
+    print_maps();
     tcg_exec_init(0);
     cpu_exec_init_all();
     /* NOTE: we need to init the CPU at this stage to get
@@ -972,15 +974,9 @@ int main(int argc, char **argv, char **envp)
     target_set_brk(info->brk);
     syscall_init();
     signal_init();
+    print_maps();
 
-#if defined(CONFIG_USE_GUEST_BASE)
-    /* Now that we've loaded the binary, GUEST_BASE is fixed.  Delay
-       generating the prologue until now so that the prologue can take
-       the real value of GUEST_BASE into account.  */
-    tcg_prologue_init(&tcg_ctx);
-#endif
 
-#if defined(TARGET_I386)
     cpu_x86_set_cpl(env, 3);
 
     env->cr[0] = CR0_PG_MASK | CR0_WP_MASK | CR0_PE_MASK;
@@ -1014,9 +1010,6 @@ int main(int argc, char **argv, char **envp)
     env->regs[R_ESP] = regs->esp;
     env->eip = regs->eip;
 
-#ifdef SIEVE_OPT
-    map_exec(env->sieve_hashtable, sizeof(env->sieve_hashtable));
-#endif
 
     /* linux interrupt setup */
     env->idt.limit = 255;

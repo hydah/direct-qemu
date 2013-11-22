@@ -17,11 +17,13 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #include "config.h"
-#include "cpu.h"
 #include "disas/disas.h"
-#include "tcg.h"
 #include "qemu/atomic.h"
 #include "sysemu/qtest.h"
+
+#include "ind-prof.h"
+#include "retrans-ind.h"
+#include "translate-all.h"
 
 bool qemu_cpu_has_work(CPUState *cpu)
 {
@@ -49,11 +51,36 @@ void cpu_resume_from_signal(CPUArchState *env, void *puc)
 }
 #endif
 
-/* Execute a TB, and fix up the CPU state afterwards if necessary */
-static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, uint8_t *tb_ptr)
+void handle_syscall(CPUX86State *env, int trapnr)
 {
-    CPUArchState *env = cpu->env_ptr;
-    tcg_target_ulong next_tb = tcg_qemu_tb_exec(env, tb_ptr);
+    abi_ulong pc;
+    //fprintf(stderr, "this is %s\n", __FUNCTION__);
+    switch(trapnr) {
+        case 0x80:
+            /* linux syscall from int $0x80 */
+            env->regs[R_EAX] = do_syscall(env,
+                    env->regs[R_EAX],
+                    env->regs[R_EBX],
+                    env->regs[R_ECX],
+                    env->regs[R_EDX],
+                    env->regs[R_ESI],
+                    env->regs[R_EDI],
+                    env->regs[R_EBP]);
+            break;
+        default:
+            pc = env->segs[R_CS].base + env->eip;
+            fprintf(stderr, "qemu: 0x%08lx: unhandled CPU exception 0x%x - aborting\n",
+                    (long)pc, trapnr);
+            abort();
+    }
+}
+
+/* Execute a TB, and fix up the CPU state afterwards if necessary */
+static inline uint32_t cpu_tb_exec(CPUState *cpu, uint8_t *tb_ptr)
+{
+    CPUX86State *env = cpu->env_ptr;
+    tcg_target_ulong next_tb = tcg_qemu_tb_exec(tb_ptr);
+
     if ((next_tb & TB_EXIT_MASK) > TB_EXIT_IDX1) {
         /* We didn't start executing this TB (eg because the instruction
          * counter hit zero); we must restore the guest PC to the address
@@ -74,6 +101,11 @@ static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, uint8_t *tb_ptr)
          */
         cpu->tcg_exit_req = 0;
     }
+
+    if (env->ind_type == TYPE_SYSCALL) {
+        handle_syscall(env, env->trapnr);
+    }
+
     return next_tb;
 }
 
@@ -100,10 +132,9 @@ static void cpu_exec_nocache(CPUArchState *env, int max_cycles,
     tb_free(tb);
 }
 
-static TranslationBlock *tb_find_slow(CPUArchState *env,
-                                      target_ulong pc,
-                                      target_ulong cs_base,
-                                      uint64_t flags)
+static TranslationBlock *tb_find_slow(CPUArchState *env, target_ulong pc,
+                                      target_ulong tb_tag
+                                      )
 {
     TranslationBlock *tb, **ptb1;
     unsigned int h;
@@ -113,63 +144,43 @@ static TranslationBlock *tb_find_slow(CPUArchState *env,
     tcg_ctx.tb_ctx.tb_invalidated_flag = 0;
 
     /* find translated block using physical mappings */
-    phys_pc = get_page_addr_code(env, pc);
-    phys_page1 = phys_pc & TARGET_PAGE_MASK;
-    h = tb_phys_hash_func(phys_pc);
+//    phys_pc = get_page_addr_code(env, pc);
+ //   phys_page1 = phys_pc & TARGET_PAGE_MASK;
+    h = tb_phys_hash_func(pc);
     ptb1 = &tcg_ctx.tb_ctx.tb_phys_hash[h];
     for(;;) {
         tb = *ptb1;
         if (!tb)
             goto not_found;
         if (tb->pc == pc &&
-            tb->page_addr[0] == phys_page1 &&
-            tb->cs_base == cs_base &&
-            tb->flags == flags) {
-            /* check next page if needed */
-            if (tb->page_addr[1] != -1) {
-                tb_page_addr_t phys_page2;
-
-                virt_page2 = (pc & TARGET_PAGE_MASK) +
-                    TARGET_PAGE_SIZE;
-                phys_page2 = get_page_addr_code(env, virt_page2);
-                if (tb->page_addr[1] == phys_page2)
-                    goto found;
-            } else {
+            tb->tb_tag == tb_tag) {
                 goto found;
-            }
         }
         ptb1 = &tb->phys_hash_next;
     }
  not_found:
-   /* if no translated code available, then translate it now */
-    tb = tb_gen_code(env, pc, cs_base, flags, 0);
+    return NULL;
 
  found:
-    /* Move the last found TB to the head of the list */
-    if (likely(*ptb1)) {
-        *ptb1 = tb->phys_hash_next;
-        tb->phys_hash_next = tcg_ctx.tb_ctx.tb_phys_hash[h];
-        tcg_ctx.tb_ctx.tb_phys_hash[h] = tb;
-    }
     /* we add the TB in the virtual pc hash table */
     env->tb_jmp_cache[tb_jmp_cache_hash_func(pc)] = tb;
     return tb;
 }
 
-static inline TranslationBlock *tb_find_fast(CPUArchState *env)
+inline TranslationBlock *tb_find_fast(CPUX86State *env, uint32_t pc,  uint32_t tb_tag)
 {
     TranslationBlock *tb;
-    target_ulong cs_base, pc;
+    target_ulong cs_base;
     int flags;
 
     /* we record a subset of the CPU state. It will
        always be the same before a given translated block
        is executed. */
-    cpu_get_tb_cpu_state(env, &pc, &cs_base, &flags);
+    //cpu_get_tb_cpu_state(env, &pc, &cs_base, &flags);
     tb = env->tb_jmp_cache[tb_jmp_cache_hash_func(pc)];
-    if (unlikely(!tb || tb->pc != pc || tb->cs_base != cs_base ||
-                 tb->flags != flags)) {
-        tb = tb_find_slow(env, pc, cs_base, flags);
+    
+    if (unlikely(!tb || tb->pc != pc || tb->tb_tag != tb_tag)) {
+        tb = tb_find_slow(env, pc, tb_tag);
     }
     return tb;
 }
@@ -197,9 +208,96 @@ static void cpu_handle_debug_exception(CPUArchState *env)
 
 /* main execution loop */
 
+static TranslationBlock *get_next_tb(CPUX86State *env, uint32_t cur_pc,
+                                     TranslationBlock *prev_tb)
+{
+    TranslationBlock *tb;
+    uint32_t tb_tag;
+
+    tb_tag = NORMAL_TB_TAG;
+
+    tb = tb_find_fast(env, cur_pc, tb_tag);
+
+    if (tb == NULL) {
+        /* tb doesn't exist */
+        ///fprintf(stderr, "ind tb_tag: 0x%x\n", tb_tag);
+        /* if no translated code available, then translate it now */
+        if (env->ind_type != NOT_IND && env->ind_type != TYPE_SYSCALL) {
+            switch(env->ind_type) {
+              case IND_TYPE_CALL:
+              case IND_TYPE_CALL_SP:
+   /* if no translated code available, then translate it now */
+                tb = make_tb(env, cur_pc, cur_pc, tb_tag);
+                break;
+              case IND_TYPE_JMP:
+              case IND_TYPE_JMP_SP:
+                tb = make_tb(env, cur_pc, env->ind_dest, tb_tag);
+                break;
+              case IND_TYPE_RET:
+              case IND_TYPE_RET_SP:
+                tb = make_tb(env, cur_pc, cur_pc, tb_tag);
+                break;
+              case IND_TYPE_RECUR:
+                tb = make_tb(env, cur_pc, env->ind_dest, tb_tag);
+                break;
+              default:
+                tb = make_tb(env, cur_pc, 0, tb_tag);
+                fprintf(stderr, "default tb_tag: 0x%x\n", tb_tag);
+                break;
+            }
+        } else {
+            if(prev_tb != NULL) {
+                tb = make_tb(env, cur_pc, prev_tb->func_addr, tb_tag);
+            } else {
+                tb = make_tb(env, cur_pc, 0, tb_tag);
+                fprintf(stderr, "unexpected path: 0x%x\n", cur_pc);
+            }
+        }
+        (void)cpu_gen_code(env, tb);
+    } else if (tb->tc_ptr == (uint8_t *)NOT_TRANS_YET) {
+        /* tb exists, but not translated yes */
+        (void)cpu_gen_code(env, tb);
+    }
+
+    return tb;
+}
+
+#ifdef IND_OPT
+static void patch_jmp_target(TranslationBlock *tb, 
+                             uint32_t src_addr, uint32_t dest_addr)
+{
+     int jmp_index;
+
+     //fprintf(stderr, "src:0x%x tgt:0x%x dest:0x%x\n", tb->pc, src_addr, dest_addr);
+     jmp_index = tb->jmp_ind_index;
+     *(uint32_t *)(tb->jind_src_addr[jmp_index]) = -src_addr;
+     *(uint32_t *)(tb->jind_dest_addr[jmp_index]) =
+          dest_addr - tb->jind_dest_addr[jmp_index] - 4;
+     tb->jmp_ind = 0;
+     tb->jmp_ind_index++;
+}
+
+static void patch_ind_opt(CPUX86State *env, TCGContext *cgc, TranslationBlock *prev_tb, TranslationBlock *tb)
+{
+    uint32_t tgt_addr;
+
+    tgt_addr = env->eip;
+
+    if(prev_tb->jmp_ind_index < IND_SLOT_MAX) {
+        patch_jmp_target(prev_tb, tgt_addr, (uint32_t)tb->tc_ptr);
+    } else {
+        /* jmp_target was already filled, add enter_sieve now */
+        ind_patch_sieve(env, cgc, prev_tb->ind_enter_sieve);
+    }
+}
+#endif
+
+int prolog_count = 0;
+
 volatile sig_atomic_t exit_request;
 
-int cpu_exec(CPUArchState *env)
+#if 0
+int cpu_exec(CPUX86State *env)
 {
     CPUState *cpu = ENV_GET_CPU(env);
     CPUClass *cc = CPU_GET_CLASS(cpu);
@@ -209,7 +307,6 @@ int cpu_exec(CPUArchState *env)
     tcg_target_ulong next_tb;
 
     env->tb_tag = 0;
-    new_tb_count = -500;
 #ifdef RETRANS_IND
     env->has_ind = false;
 #endif
@@ -369,20 +466,20 @@ int cpu_exec(CPUArchState *env)
 #endif /* DEBUG_DISAS */
                 spin_lock(&tcg_ctx.tb_ctx.tb_lock);
                 
-                tb = get_next_tb(env, env->eip, (TranslationBlock *)next_tb);
+                next_tb = get_next_tb(env, env->eip, (TranslationBlock *)next_tb);
 
                 if (env->ind_type != NOT_IND) {
                     /* from {ret, ind_jmp, ind_call} */
-                    if(prev_tb == 0) {
+                    if(next_tb == 0) {
                         /*from sieve */
                         add_sieve_entry(env, tb, env->ind_type);
                         env->ind_type = NOT_IND;
                     } else {
-                        if (env->ind_type == TYPE_SYACALL) {
+                        if (env->ind_type == TYPE_SYSCALL) {
                             next_tb = 0;
                         } else {
 #ifdef IND_OPT
-                            patch_ind_opt((TranslationBlock *)next_tb, tb);
+                            patch_ind_opt(env, (TranslationBlock *)next_tb, tb);
                             next_tb = 0;
 #endif
                         }
@@ -489,3 +586,91 @@ int cpu_exec(CPUArchState *env)
     current_cpu = NULL;
     return ret;
 }
+#endif
+
+int cpu_exec(CPUX86State *env)
+{
+    int ret;
+    TranslationBlock *tb;
+    uint8_t *tc_ptr;
+    uint32_t prev_tb;
+    int new_tb_count;
+    TCGContext *cgc = &tcg_ctx;
+
+    cgc->tb_tag = 0;
+    prev_tb = 0; /* force lookup of first TB */
+    new_tb_count = -500;
+
+#ifdef RETRANS_IND
+    env->has_ind = false;
+#endif
+
+    for(;;) {
+        prolog_count++;
+
+        tb = get_next_tb(env, env->eip, (TranslationBlock *)prev_tb);
+
+        if(env->ind_type != NOT_IND) {
+            /* from {ret, ind_jmp, ind_call} */
+            if(prev_tb == 0) {
+				/* from sieve */
+				add_sieve_entry(cgc, tb, env->ind_type);
+				env->ind_type = NOT_IND;
+            } else {
+                if (env->ind_type == TYPE_SYSCALL) {
+                    prev_tb = 0;
+                } else {
+#ifdef IND_OPT
+                    patch_ind_opt(env, cgc, (TranslationBlock *)prev_tb, tb);
+                    prev_tb = 0;
+#endif
+                }
+            }
+        }
+
+#ifdef CONFIG_DEBUG_EXEC
+        qemu_log_mask(CPU_LOG_EXEC, "Trace 0x%08lx [" TARGET_FMT_lx "] %s\n",
+                     (long)tb->tc_ptr, tb->pc,
+                     lookup_symbol(tb->pc));
+#endif
+
+        /* link tb */
+        if(prev_tb != 0 && (uint32_t)tb != prev_tb) {
+            tb_add_jump((TranslationBlock *)prev_tb, cgc->patch_num, tb);
+        }
+
+#ifdef RETRANS_IND
+        if(env->has_ind == true) {
+            chg_tbs_tag((TranslationBlock *)(env->ind_tb), NORMAL_TB_TAG);
+            env->has_ind = false;
+        }
+#endif
+
+        /* clear env */
+        tc_ptr = tb->tc_ptr;
+        env->target_tc = (uint32_t)tc_ptr;
+        env->ret_tb = 0;
+        env->trapnr = -1;
+        env->ind_type = NOT_IND;
+       
+        /* enter code cache */
+        fprintf(stderr, "tp->pc is %x \n", tb->pc); 
+        if (tb->pc == 0x8054460) {
+            fprintf(stderr, "bingo!!!\n");
+        }
+
+        prev_tb = tcg_qemu_tb_exec(tc_ptr);
+        
+        if (env->ind_type == TYPE_SYSCALL) {
+            //fprintf(stderr, "env->trapnr is %d\n", env->trapnr);
+            handle_syscall(env, env->trapnr); 
+        }
+
+        //fprintf(stderr, "prev_tb = 0x%x pc = 0x%x\n", prev_tb, env->eip);
+
+        //env->current_tb = NULL;
+    } /* for(;;) */
+
+    return ret;
+}
+

@@ -2494,7 +2494,6 @@ static void x86_cpu_initfn(Object *obj)
     /* init various static tables used in TCG mode */
     if (tcg_enabled() && !inited) {
         inited = 1;
-        optimize_flags_init();
 #ifndef CONFIG_USER_ONLY
         cpu_set_debug_excp_handler(breakpoint_handler);
 #endif

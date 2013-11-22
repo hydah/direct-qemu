@@ -20,6 +20,8 @@
 #ifndef _EXEC_ALL_H_
 #define _EXEC_ALL_H_
 
+#include "opt-def.h"
+
 #include "qemu-common.h"
 
 /* allow to see translation results - the slowdown should be negligible, so we leave it */
@@ -78,8 +80,7 @@ void restore_state_to_opc(CPUArchState *env, struct TranslationBlock *tb,
                           int pc_pos);
 
 void cpu_gen_init(void);
-int cpu_gen_code(CPUArchState *env, struct TranslationBlock *tb,
-                 int *gen_code_size_ptr);
+int cpu_gen_code(CPUArchState *env, struct TranslationBlock *tb);
 bool cpu_restore_state(CPUArchState *env, uintptr_t searched_pc);
 
 void QEMU_NORETURN cpu_resume_from_signal(CPUArchState *env1, void *puc);
@@ -133,6 +134,23 @@ static inline void tlb_flush(CPUArchState *env, int flush_global)
 #define USE_DIRECT_JUMP
 #endif
 
+#ifdef SWITCH_OPT
+#define DEFAULT_SWITCH_CASE_BUFFER_SIZE (256 * 1024 * 1024)
+#endif
+
+#define NOT_TRANS_YET	0xdeadbeaf
+#define CONT_TRANS_TAG	(PATCH_MAX - 1)
+#define PATCH_MAX	8
+
+#define IND_TGT_SIZE		128
+#define IND_TGT_NODE_MAX	(1024*16*16)
+#define IND_HASH(a)	((a >> 4) & (IND_TGT_SIZE - 1))
+
+typedef struct ind_tgt_stat {
+    uint32_t tgt_count[IND_TGT_SIZE];
+} ind_tgt_stat;
+extern ind_tgt_stat ind_tgt_nodes[];
+
 struct TranslationBlock {
     target_ulong pc;   /* simulated PC corresponding to this block (EIP + CS base) */
     target_ulong cs_base; /* CS base for this block */
@@ -151,22 +169,60 @@ struct TranslationBlock {
     struct TranslationBlock *page_next[2];
     tb_page_addr_t page_addr[2];
 
+    uint32_t icount;
+
+    uint32_t func_addr;
+    uint32_t tb_tag;
+    uint16_t hcode_size;      /* size of host code for this block */
+    uint32_t insn_count;
+    uint32_t ind_miss_count;
+    uint32_t shadow_fail_count;
+	uint32_t ind_replace_count;
+
+
     /* the following data are used to directly call another TB from
        the code of this one. */
-    uint16_t tb_next_offset[2]; /* offset of original jump target */
-#ifdef USE_DIRECT_JUMP
-    uint16_t tb_jmp_offset[2]; /* offset of jump instruction */
-#else
-    uintptr_t tb_next[2]; /* address of jump generated code */
+    uint32_t patch_num;
+    uint16_t tb_jmp_offset[PATCH_MAX]; /* offset of jump instruction */
+    struct TranslationBlock *jmp_next[PATCH_MAX];
+
+    /* indicated which tbs are jumped into this tb, 
+       and from which of their jmp_stub */
+    struct TranslationBlock *jmp_from[TB_FROM_MAX];
+    uint8_t jmp_from_num[TB_FROM_MAX]; /* */
+    uint32_t jmp_from_index;
+
+    uint32_t prof_pos;
+#ifdef IND_OPT
+    uint32_t type;
+
+    uint32_t jind_src_addr[IND_SLOT_MAX];
+    uint32_t jind_dest_addr[IND_SLOT_MAX];
+	/* add for mru */
+	uint32_t mru_src;
+	uint32_t mru_dest;
+    uint32_t jmp_ind;
+    uint32_t jmp_ind_index;
+    uint8_t *retrans_patch_ptr;
+    uint8_t *ind_enter_sieve;
+#ifdef SWITCH_OPT
+	uint32_t sa_base;
+	uint32_t shadow_base;
+	uint32_t sa_entry_sum;
+	uint8_t *shadow_code_start;
+    uint8_t *shadow_profile_start;
+	uint32_t shadow_bound[2];
+    uint32_t ind_dyn_count;
 #endif
-    /* list of TBs jumping to this one. This is a circular list using
-       the two least significant bits of the pointers to tell what is
-       the next pointer: 0 = jmp_next[0], 1 = jmp_next[1], 2 =
-       jmp_first */
-    struct TranslationBlock *jmp_next[2];
-    struct TranslationBlock *jmp_first;
-    uint32_t icount;
-};
+
+    bool     has_ind;
+    bool     retransed;
+    uint32_t retrans_count;
+    uint32_t retrans_count_max;
+
+    ind_tgt_stat *ind_tgt;
+#endif
+} __attribute__ ((aligned (32)));
 
 #include "exec/spinlock.h"
 
@@ -274,9 +330,12 @@ static inline void tb_set_jmp_target(TranslationBlock *tb,
 
 /* set the jump target */
 static inline void tb_set_jmp_target(TranslationBlock *tb,
-                                     int n, uintptr_t addr)
+                                     int n, unsigned long addr)
 {
-    tb->tb_next[n] = addr;
+    unsigned long offset;
+
+    offset = tb->tb_jmp_offset[n];
+    tb_set_jmp_target1((unsigned long)(tb->tc_ptr + offset), addr);
 }
 
 #endif
@@ -284,15 +343,10 @@ static inline void tb_set_jmp_target(TranslationBlock *tb,
 static inline void tb_add_jump(TranslationBlock *tb, int n,
                                TranslationBlock *tb_next)
 {
-    /* NOTE: this test is only needed for thread safety */
-    if (!tb->jmp_next[n]) {
-        /* patch the native jump address */
-        tb_set_jmp_target(tb, n, (uintptr_t)tb_next->tc_ptr);
+    /* patch the native jump address */
+    tb_set_jmp_target(tb, n, ((unsigned long)tb_next->tc_ptr));
 
-        /* add in TB jmp circular list */
-        tb->jmp_next[n] = tb_next->jmp_first;
-        tb_next->jmp_first = (TranslationBlock *)((uintptr_t)(tb) | (n));
-    }
+    tb_add_jmp_from(tb, tb_next, n);
 }
 
 /* The return address may point to the start of the next instruction.

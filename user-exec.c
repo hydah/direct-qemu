@@ -19,7 +19,6 @@
 #include "config.h"
 #include "cpu.h"
 #include "disas/disas.h"
-#include "tcg.h"
 #include "qemu/bitops.h"
 
 #undef EAX
