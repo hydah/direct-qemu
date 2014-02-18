@@ -654,10 +654,12 @@ int cpu_exec(CPUX86State *env)
         env->ind_type = NOT_IND;
        
         /* enter code cache */
+#if 0
         fprintf(stderr, "tp->pc is %x \n", tb->pc); 
-        if (tb->pc == 0x8054460) {
+        if (tb->pc == 0x8052b00) {
             fprintf(stderr, "bingo!!!\n");
         }
+#endif
 
         prev_tb = tcg_qemu_tb_exec(tc_ptr);
         

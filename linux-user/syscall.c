@@ -5194,6 +5194,7 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
         break;
     case TARGET_NR_brk:
         ret = do_brk(arg1);
+        //ret = syscall(__NR_brk, arg1);
         break;
     case TARGET_NR_fork:
         ret = get_errno(do_fork(cpu_env, SIGCHLD, 0, 0, 0, 0));
@@ -8520,7 +8521,8 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
       }
       break;
 #elif defined(TARGET_I386) && defined(TARGET_ABI32)
-      ret = do_set_thread_area(cpu_env, arg1);
+      //ret = do_set_thread_area(cpu_env, arg1);
+        ret = syscall(__NR_set_thread_area, arg1);
       break;
 #elif defined(TARGET_M68K)
       {

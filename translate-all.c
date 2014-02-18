@@ -363,6 +363,8 @@ void tcg_prologue_init(CPUX86State *env, TCGContext *cgc)
     /* init global prologue and epilogue */
     int i;
     uint32_t addr;
+    fprintf(stderr, "code_gen_buffer  is %x \n", cgc->code_gen_buffer);
+    fprintf(stderr, "sieve_buffer  is %x \n", cgc->sieve_buffer);
     fprintf(stderr, "tcg_ctx  is %x \n", cgc);
     cgc->code_buf = cgc->code_gen_prologue;
     cgc->code_ptr = cgc->code_buf;
@@ -723,7 +725,7 @@ static inline PageDesc *page_find(tb_page_addr_t index)
    user mode. It will change when a dedicated libc will be used.  */
 /* ??? 64-bit hosts ought to have no problem mmaping data outside the
    region in which the guest needs to run.  Revisit this.  */
-#define USE_STATIC_CODE_GEN_BUFFER
+//#define USE_STATIC_CODE_GEN_BUFFER
 #endif
 
 /* ??? Should configure for this, not list operating systems here.  */
@@ -755,15 +757,7 @@ static inline size_t size_code_gen_buffer(size_t tb_size)
 {
     /* Size the buffer.  */
     if (tb_size == 0) {
-#ifdef USE_STATIC_CODE_GEN_BUFFER
         tb_size = DEFAULT_CODE_GEN_BUFFER_SIZE;
-#else
-        /* ??? Needs adjustments.  */
-        /* ??? If we relax the requirement that CONFIG_USER_ONLY use the
-           static buffer, we could size this on RESERVED_VA, on the text
-           segment size of the executable, or continue to use the default.  */
-        tb_size = (unsigned long)(ram_size / 4);
-#endif
     }
     if (tb_size < MIN_CODE_GEN_BUFFER_SIZE) {
         tb_size = MIN_CODE_GEN_BUFFER_SIZE;
@@ -778,6 +772,7 @@ static inline size_t size_code_gen_buffer(size_t tb_size)
 #ifdef USE_STATIC_CODE_GEN_BUFFER
 static uint8_t static_code_gen_buffer[DEFAULT_CODE_GEN_BUFFER_SIZE]
     __attribute__((aligned(CODE_GEN_ALIGN)));
+/* add by heyu */
 static uint8_t static_sieve_buffer[DEFAULT_SIEVE_BUFFER_SIZE]
     __attribute__((aligned(CODE_GEN_ALIGN)));
 
@@ -785,6 +780,11 @@ static inline void *alloc_code_gen_buffer(void)
 {
     map_exec(static_code_gen_buffer, tcg_ctx.code_gen_buffer_size);
     return static_code_gen_buffer;
+}
+static inline void *alloc_sieve_buffer(void)
+{
+    map_exec(static_sieve_buffer, tcg_ctx.sieve_buffer_size);
+    return static_sieve_buffer;
 }
 #elif defined(USE_MMAP)
 static inline void *alloc_code_gen_buffer(void)
@@ -819,6 +819,38 @@ static inline void *alloc_code_gen_buffer(void)
                PROT_WRITE | PROT_READ | PROT_EXEC, flags, -1, 0);
     return buf == MAP_FAILED ? NULL : buf;
 }
+static inline void *alloc_sieve_buffer(void)
+{
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    uintptr_t start = 0;
+    void *buf;
+
+    /* Constrain the position of the buffer based on the host cpu.
+       Note that these addresses are chosen in concert with the
+       addresses assigned in the relevant linker script file.  */
+# if defined(__PIE__) || defined(__PIC__)
+    /* Don't bother setting a preferred location if we're building
+       a position-independent executable.  We're more likely to get
+       an address near the main executable if we let the kernel
+       choose the address.  */
+# elif defined(__x86_64__) && defined(MAP_32BIT)
+    /* Force the memory down into low memory with the executable.
+       Leave the choice of exact location with the kernel.  */
+    flags |= MAP_32BIT;
+    /* Cannot expect to map more than 800MB in low memory.  */
+    if (tcg_ctx.sieve_buffer_size > 800u * 1024 * 1024) {
+        tcg_ctx.sieve_buffer_size = 800u * 1024 * 1024;
+    }
+# elif defined(__sparc__)
+    start = 0x40000000ul;
+# elif defined(__s390x__)
+    start = 0x90000000ul;
+# endif
+
+    buf = mmap((void *)start, tcg_ctx.sieve_buffer_size,
+               PROT_WRITE | PROT_READ | PROT_EXEC, flags, -1, 0);
+    return buf == MAP_FAILED ? NULL : buf;
+}
 #else
 static inline void *alloc_code_gen_buffer(void)
 {
@@ -826,6 +858,15 @@ static inline void *alloc_code_gen_buffer(void)
 
     if (buf) {
         map_exec(buf, tcg_ctx.code_gen_buffer_size);
+    }
+    return buf;
+}
+static inline void *alloc_sieve_buffer(void)
+{
+    void *buf = g_malloc(tcg_ctx.sieve_buffer_size);
+
+    if (buf) {
+        map_exec(buf, tcg_ctx.sieve_buffer_size);
     }
     return buf;
 }
@@ -837,24 +878,23 @@ static inline void code_gen_alloc(size_t tb_size)
     tcg_ctx.code_gen_buffer = alloc_code_gen_buffer();
 
     tcg_ctx.sieve_buffer_size = DEFAULT_SIEVE_BUFFER_SIZE;
-    map_exec(static_sieve_buffer, tcg_ctx.sieve_buffer_size);
-    tcg_ctx.sieve_buffer  = static_sieve_buffer;
+    tcg_ctx.sieve_buffer  = alloc_sieve_buffer();
 
     if (tcg_ctx.code_gen_buffer == NULL) {
         fprintf(stderr, "Could not allocate dynamic translator buffer\n");
         exit(1);
     }
 
-    //qemu_madvise(tcg_ctx.code_gen_buffer, tcg_ctx.code_gen_buffer_size,
-     //       QEMU_MADV_HUGEPAGE);
+    qemu_madvise(tcg_ctx.code_gen_buffer, tcg_ctx.code_gen_buffer_size,
+            QEMU_MADV_HUGEPAGE);
 
     if (tcg_ctx.sieve_buffer == NULL) {
         fprintf(stderr, "Could not allocate sieve buffer\n");
         exit(1);
     }
 
-   // qemu_madvise(tcg_ctx.sieve_buffer, tcg_ctx.sieve_buffer_size,
-   //         QEMU_MADV_HUGEPAGE);
+    qemu_madvise(tcg_ctx.sieve_buffer, tcg_ctx.sieve_buffer_size,
+            QEMU_MADV_HUGEPAGE);
 
     /* Steal room for the prologue at the end of the buffer.  This ensures
        (via the MAX_CODE_GEN_BUFFER_SIZE limits above) that direct branches

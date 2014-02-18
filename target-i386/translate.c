@@ -742,7 +742,6 @@ static void cemit_sieve_nopush(CPUX86State *env, TCGContext *cgc, uint32_t sieve
     uint32_t jmp_offset;
     /* jmp sieve_stub */
     code_emit8(cgc->code_ptr, 0xe9u);
-    fprintf(stderr, "sieve_stub is %x\n", sieve_stub);
     jmp_offset = sieve_stub - cgc->code_ptr - 4;
     code_emit32(cgc->code_ptr, jmp_offset);
 }

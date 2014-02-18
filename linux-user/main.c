@@ -871,7 +871,6 @@ int main(int argc, char **argv, char **envp)
     if (cpu_model == NULL) {
         cpu_model = "qemu32";
     }
-    print_maps();
     tcg_exec_init(0);
     cpu_exec_init_all();
     /* NOTE: we need to init the CPU at this stage to get
@@ -974,7 +973,6 @@ int main(int argc, char **argv, char **envp)
     target_set_brk(info->brk);
     syscall_init();
     signal_init();
-    print_maps();
 
 
     cpu_x86_set_cpl(env, 3);
